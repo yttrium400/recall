@@ -2,30 +2,21 @@
 
 **A flight recorder for AI agents.**
 
-Record every LLM call your agent makes. Replay it later - deterministically, for free, with no API calls. Inject different responses to debug exactly where your agent went wrong.
+Your agent ran 12 steps, failed on step 8, and you have no idea why. The logs show an exception. The LLM response was wrong. But you can't reproduce it - the next run is different.
 
-```
+**recall** records every LLM call your agent makes to a plain JSON file. Then lets you replay the session without spending tokens, or inject a different response at any step to test a fix.
+
+```bash
 pip install recall-agent
 ```
 
----
-
-## The problem
-
-Your agent ran 12 steps, then hallucinated a tool name and crashed. You have no idea:
-- What the model actually saw at step 8
-- Whether the failure was in your prompt, your tool results, or the model output
-- How to reproduce it - the next run will be different
-
-Existing tools (LangSmith, Langfuse, W&B Weave) solve this, but they require accounts, infrastructure, and are deeply coupled to specific frameworks.
-
-**recall** is two functions and a CLI. It works with any LLM SDK. Sessions are plain JSON files you own locally.
+Works with **Anthropic** and **OpenAI** SDKs. No accounts. No infrastructure. Files you own.
 
 ---
 
 ## Record
 
-One line to wrap your client. Everything else is unchanged.
+One line to wrap your client. Everything else stays the same.
 
 ```python
 import anthropic
@@ -33,77 +24,101 @@ from recall import record
 
 client = record(anthropic.Anthropic())
 
-# use it exactly as before - every call is recorded
-response = client.messages.create(
-    model="claude-sonnet-4-6",
-    max_tokens=1024,
-    messages=[{"role": "user", "content": "..."}],
-)
+# your agent code, unchanged
+messages = [{"role": "user", "content": "Analyze this bug report..."}]
+
+r1 = client.messages.create(model="claude-sonnet-4-6", max_tokens=1024, messages=messages)
+messages.append({"role": "assistant", "content": r1.content})
+messages.append({"role": "user", "content": "What caused it?"})
+
+r2 = client.messages.create(model="claude-sonnet-4-6", max_tokens=1024, messages=messages)
 ```
 
 Session saved to `.recall/sessions/2026-05-16T10:32:00_abc123.json`.
+
+OpenAI works the same way:
+
+```python
+from openai import OpenAI
+from recall import record
+
+client = record(OpenAI())
+response = client.chat.completions.create(model="gpt-4o", messages=[...])
+```
+
+Streaming is also supported for both providers.
 
 ---
 
 ## Inspect
 
 ```bash
-# conversation view - see what the model actually saw and said
+# conversation view - see exactly what the model saw and said, call by call
 recall play .recall/sessions/session.json
 
 # step through one call at a time
 recall play session.json --step
 
+# raw JSON events if you need them
+recall play session.json --raw
+
 # token usage, cost estimate, latency breakdown
 recall stats session.json
 
-# list all sessions with cost and token counts
+# list all sessions
 recall ls
 ```
 
-`recall play` renders the actual conversation - not raw JSON blobs:
+`recall play` shows the actual dialogue, not JSON blobs:
 
 ```
-Call #1  2026-05-16T10:32:00Z
-  user: Summarize this document and extract action items.
-  assistant: [tool_use: read_file] {"path": "report.pdf"}
+Call #1  10:32:00
+  user: Analyze this bug report: NoneType on line 47...
+  assistant: The error originates from get_user() returning None...
+  tokens: 147 in / 300 out  ~$0.0013  1.2s
 
-Call #2  2026-05-16T10:32:04Z
-  user: [tool_result] "Q3 revenue up 12%..."
-  assistant: Here are the key action items: ...
-  tokens: 1,240 in / 380 out  ~$0.009420  1,840ms
+Call #2  10:32:02
+  user: What caused it?
+  assistant: payments-api v2.1.4 removed the null check introduced in v2.0.8...
+  tokens: 469 in / 241 out  ~$0.0025  0.9s
 ```
 
 ---
 
 ## Replay
 
-This is the part that doesn't exist anywhere else.
+The part that doesn't exist anywhere else for raw SDK users.
 
 ```python
 from recall import replay
 
-# re-run your agent against the recorded session - zero API calls
+# re-run your agent - zero API calls, same responses
 client = replay(anthropic.Anthropic(), "session.json")
-response = client.messages.create(...)  # returns the recorded response instantly
+
+r1 = client.messages.create(...)  # returns the recorded response instantly
+messages.append({"role": "assistant", "content": r1.content})
+
+r2 = client.messages.create(...)  # same
 ```
 
-Your agent code runs unchanged. But instead of hitting the API, every call returns the exact response you recorded. Deterministic. Instant. Free.
+Your agent code runs unchanged. Every `messages.create()` call returns the exact response from the recording. Deterministic, instant, free.
 
 ### Patch a response to test a fix
 
 ```python
-# what if the model had returned something different at call #2?
+# What if the model had said something different at step 1?
 client = replay(
     anthropic.Anthropic(),
     "session.json",
     patches={
-        1: {"content": [{"type": "text", "text": "I don't know how to do that."}]}
+        0: {"content": [{"type": "text", "text": "The root cause is a missing null check."}]}
     },
 )
 ```
 
-Now your agent sees a different response at step 2. Does it handle it correctly? You find out in milliseconds, not minutes, and without spending tokens.
+Now your agent sees a different response at call #0. Subsequent calls still return their recorded responses. Useful for testing: "given this corrected analysis at step 1, does the rest of my agent handle it correctly?"
+
+> **Note on multi-turn patching**: patching call N changes the context your agent builds for call N+1 onward. Calls N+1, N+2... still return their *recorded* responses, which were generated from the original context. For full re-simulation from the patch point, run the real agent with `record()` from that point.
 
 ### Compare two runs
 
@@ -111,17 +126,17 @@ Now your agent sees a different response at step 2. Does it handle it correctly?
 recall diff session_broken.json session_working.json
 ```
 
-Pinpoints the exact call where the sessions diverged.
+Pinpoints the call where the sessions diverged and shows both responses side by side.
 
 ---
 
 ## Session format
 
-Plain JSON. No proprietary format. No database.
+Plain JSON. No proprietary format. No database. Version it in git. Share it with a colleague. Parse it with `jq`.
 
 ```json
 {
-  "id": "7909d66c-94ca-4556-aae3-5c299f2460f0",
+  "id": "ca4a2165-...",
   "started_at": "2026-05-16T10:32:00Z",
   "provider": "anthropic",
   "model": "claude-sonnet-4-6",
@@ -129,21 +144,33 @@ Plain JSON. No proprietary format. No database.
     {
       "seq": 1,
       "type": "request",
-      "timestamp": "2026-05-16T10:32:00.123Z",
-      "payload": { "model": "claude-sonnet-4-6", "messages": [...] }
+      "timestamp": "...",
+      "payload": { "model": "...", "messages": [...] }
     },
     {
       "seq": 2,
       "type": "response",
-      "timestamp": "2026-05-16T10:32:01.963Z",
-      "duration_ms": 1840,
+      "timestamp": "...",
+      "duration_ms": 1240,
       "payload": { "id": "msg_...", "content": [...], "usage": {...} }
     }
   ]
 }
 ```
 
-You can read it, version it in git, share it with a colleague, or parse it with `jq`.
+---
+
+## Why not LangSmith / Langfuse / W&B Weave?
+
+Those tools are great if you're already in their ecosystem. recall is for developers who are making raw `anthropic.Anthropic()` or `OpenAI()` calls, don't want to sign up for anything, and just need to understand why their agent is failing.
+
+| | recall | LangSmith / Langfuse |
+|---|---|---|
+| Setup | `pip install recall-agent` | Account + API key + SDK wrapper |
+| Storage | Local JSON files you own | Cloud platform |
+| Framework | Any (raw SDK calls) | LangChain-first |
+| Replay | Built-in | No |
+| Cost | Free | Free tier, then pricing |
 
 ---
 
@@ -153,22 +180,45 @@ You can read it, version it in git, share it with a colleague, or parse it with 
 pip install recall-agent
 ```
 
-Requires Python 3.10+. Dependencies: `typer`, `rich`. That's it.
+Python 3.10+. Runtime dependencies: `typer`, `rich`. Bring your own `anthropic` or `openai` SDK.
+
+---
+
+## Quickstart demo
+
+```bash
+git clone https://github.com/yttrium400/recall.git
+cd recall
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+# set your API key
+export ANTHROPIC_API_KEY=...
+
+# run the multi-turn agent demo
+python demo_agent.py
+
+# inspect the recorded session
+recall ls
+recall play .recall/sessions/<session-file>.json
+recall stats .recall/sessions/<session-file>.json
+```
 
 ---
 
 ## Roadmap
 
-- [x] Anthropic SDK wrapper
-- [x] Session recording to plain JSON
-- [x] `recall play` - conversation view
-- [x] `recall stats` - tokens, cost, latency
-- [x] `recall diff` - compare sessions, find divergence point
+- [x] Anthropic SDK - batch + streaming
+- [x] OpenAI SDK - batch + streaming
+- [x] `recall play` - conversation view, delta-only per call
+- [x] `recall stats` - tokens, cost estimate, latency
+- [x] `recall ls` - session list with cost summary
+- [x] `recall diff` - compare sessions, highlight divergence
 - [x] `recall replay` - deterministic replay, zero API calls
-- [x] Response patching - inject different responses at any step
-- [ ] OpenAI SDK support
-- [ ] Streaming support
+- [x] Response patching - inject different responses to test fixes
 - [ ] `recall export --format markdown` - shareable session reports
+- [ ] Async client support
+- [ ] Tool call visualization in play view
 
 ---
 
@@ -176,8 +226,7 @@ Requires Python 3.10+. Dependencies: `typer`, `rich`. That's it.
 
 ```bash
 git clone https://github.com/yttrium400/recall.git
-cd recall
-python -m venv .venv && source .venv/bin/activate
+cd recall && python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
 ```

@@ -13,9 +13,16 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from .providers.anthropic import estimate_cost
+from .providers import anthropic as _anthropic_provider
+from .providers import openai as _openai_provider
 from .session import Event, Session
 from .storage import list_sessions, load
+
+
+def _estimate_cost(provider: str, model: str, input_tokens: int, output_tokens: int) -> float | None:
+    if provider == "openai":
+        return _openai_provider.estimate_cost(model, input_tokens, output_tokens)
+    return _anthropic_provider.estimate_cost(model, input_tokens, output_tokens)
 
 app = typer.Typer(help="recall - flight recorder for AI agent sessions")
 console = Console()
@@ -53,19 +60,25 @@ def _render_pretty(session: Session, step: bool) -> None:
         following = events_by_seq.get(req.seq + 1)
         pairs.append((req, following if following and following.type != "request" else None))
 
+    displayed_count = 0  # number of messages already shown to the user
+
     for call_idx, (req, resp) in enumerate(pairs):
         console.print()
         console.print(Rule(f"[bold]Call #{call_idx + 1}[/bold]  [dim]{req.timestamp}[/dim]", style="dim"))
 
         payload = req.payload
-        messages: list[dict[str, Any]] = payload.get("messages", [])
+        all_messages: list[dict[str, Any]] = payload.get("messages", [])
         system = payload.get("system", "")
 
-        if system:
+        if call_idx == 0 and system:
             system_text = system if isinstance(system, str) else json.dumps(system)
             console.print(Panel(system_text, title="[dim]system[/dim]", border_style="dim", expand=False))
 
-        for msg in messages:
+        # Show only messages added since the last call (skip already-displayed history)
+        new_messages = all_messages[displayed_count:]
+        displayed_count = len(all_messages) + 1  # +1 for the assistant turn we're about to show
+
+        for msg in new_messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if isinstance(content, str):
@@ -99,7 +112,7 @@ def _render_pretty(session: Session, step: bool) -> None:
                 usage = resp.payload.get("usage", {})
                 in_tok = usage.get("input_tokens", 0)
                 out_tok = usage.get("output_tokens", 0)
-                cost = estimate_cost(session.model, in_tok, out_tok)
+                cost = _estimate_cost(session.provider, session.model, in_tok, out_tok)
                 cost_str = f"  ~${cost:.6f}" if cost is not None else ""
                 dur_str = f"  {resp.duration_ms}ms" if resp.duration_ms is not None else ""
                 console.print(
@@ -206,15 +219,16 @@ def stats(
 
     for r in responses:
         usage = r.payload.get("usage", {})
-        total_in += usage.get("input_tokens", 0)
-        total_out += usage.get("output_tokens", 0)
+        # Anthropic: input_tokens/output_tokens; OpenAI: prompt_tokens/completion_tokens
+        total_in += usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+        total_out += usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         total_cache_read += usage.get("cache_read_input_tokens", 0)
         total_cache_write += usage.get("cache_creation_input_tokens", 0)
         if r.duration_ms is not None:
             total_ms += r.duration_ms
             latencies.append(r.duration_ms)
 
-    cost = estimate_cost(session.model, total_in, total_out)
+    cost = _estimate_cost(session.provider, session.model, total_in, total_out)
 
     table = Table(title=f"Stats: {path.name}", show_header=False, box=None, padding=(0, 2))
     table.add_column(style="dim", no_wrap=True)
@@ -268,9 +282,15 @@ def ls(
             s = load(p)
             responses = [e for e in s.events if e.type == "response"]
             calls = len(responses)
-            in_tok = sum(e.payload.get("usage", {}).get("input_tokens", 0) for e in responses)
-            out_tok = sum(e.payload.get("usage", {}).get("output_tokens", 0) for e in responses)
-            cost = estimate_cost(s.model, in_tok, out_tok)
+            in_tok = sum(
+                (e.payload.get("usage", {}).get("input_tokens", 0) or e.payload.get("usage", {}).get("prompt_tokens", 0))
+                for e in responses
+            )
+            out_tok = sum(
+                (e.payload.get("usage", {}).get("output_tokens", 0) or e.payload.get("usage", {}).get("completion_tokens", 0))
+                for e in responses
+            )
+            cost = _estimate_cost(s.provider, s.model, in_tok, out_tok)
             cost_str = f"${cost:.5f}" if cost is not None else "-"
             tok_str = f"{in_tok + out_tok:,}" if (in_tok or out_tok) else "-"
             table.add_row(p.name, s.model or "-", str(calls), tok_str, cost_str, s.started_at)
