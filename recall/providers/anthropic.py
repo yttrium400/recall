@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -220,3 +221,144 @@ class AnthropicReplayMessages:
 
     def stream(self, **_kwargs: Any) -> _FakeStreamManager:
         return _FakeStreamManager(self._next_message())
+
+
+# ---------------------------------------------------------------------------
+# Async fake stream manager for replay
+# ---------------------------------------------------------------------------
+
+class _AsyncFakeStreamManager:
+    """Async context manager that yields a FakeStream for replay."""
+
+    def __init__(self, message: Any) -> None:
+        self._message = message
+
+    async def __aenter__(self) -> _FakeStream:
+        return _FakeStream(self._message)
+
+    async def __aexit__(self, *_: Any) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Async recording stream context manager
+# ---------------------------------------------------------------------------
+
+class _AsyncRecordingStreamManager:
+    """Async context manager wrapping the real async Anthropic stream; records on exit."""
+
+    def __init__(self, original_cm: Any, session: Session) -> None:
+        self._cm = original_cm
+        self._session = session
+        self._t0 = time.monotonic()
+        self._stream: Any = None
+
+    async def __aenter__(self) -> Any:
+        self._stream = await self._cm.__aenter__()
+        return self._stream
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
+        result = await self._cm.__aexit__(exc_type, exc_val, exc_tb)
+        if exc_type is None and self._stream is not None:
+            try:
+                message = self._stream.get_final_message()
+                duration_ms = int((time.monotonic() - self._t0) * 1000)
+                self._session.add_event(Event(
+                    seq=self._session.next_seq(),
+                    type="response",
+                    timestamp=_now(),
+                    payload=normalize_response(message),
+                    duration_ms=duration_ms,
+                ))
+                await asyncio.to_thread(save, self._session)
+            except Exception:
+                pass
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Async recorded messages wrapper
+# ---------------------------------------------------------------------------
+
+class AsyncAnthropicRecordedMessages:
+    def __init__(self, original: Any, session: Session) -> None:
+        self._original = original
+        self._session = session
+
+    async def create(self, **kwargs: Any) -> Any:
+        self._session.add_event(Event(
+            seq=self._session.next_seq(),
+            type="request",
+            timestamp=_now(),
+            payload=normalize_request(kwargs),
+        ))
+        if not self._session.model:
+            self._session.model = kwargs.get("model", "")
+
+        t0 = time.monotonic()
+        try:
+            response = await self._original.create(**kwargs)
+        except Exception as exc:
+            self._session.add_event(Event(
+                seq=self._session.next_seq(),
+                type="error",
+                timestamp=_now(),
+                payload={"error": str(exc), "type": type(exc).__name__},
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            ))
+            await asyncio.to_thread(save, self._session)
+            raise
+
+        self._session.add_event(Event(
+            seq=self._session.next_seq(),
+            type="response",
+            timestamp=_now(),
+            payload=normalize_response(response),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        ))
+        await asyncio.to_thread(save, self._session)
+        return response
+
+    def stream(self, **kwargs: Any) -> _AsyncRecordingStreamManager:
+        self._session.add_event(Event(
+            seq=self._session.next_seq(),
+            type="request",
+            timestamp=_now(),
+            payload=normalize_request(kwargs),
+        ))
+        if not self._session.model:
+            self._session.model = kwargs.get("model", "")
+        return _AsyncRecordingStreamManager(self._original.stream(**kwargs), self._session)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._original, name)
+
+
+# ---------------------------------------------------------------------------
+# Async replay messages wrapper
+# ---------------------------------------------------------------------------
+
+class AsyncAnthropicReplayMessages:
+    def __init__(self, session: Session, patches: dict[int, dict[str, Any]]) -> None:
+        self._responses = [e for e in session.events if e.type == "response"]
+        self._patches = patches
+        self._call_index = 0
+
+    def _next_message(self) -> Any:
+        idx = self._call_index
+        self._call_index += 1
+        if idx >= len(self._responses):
+            raise IndexError(
+                f"Replay exhausted: session has {len(self._responses)} recorded response(s), "
+                f"but this is call #{idx + 1}"
+            )
+        payload = dict(self._responses[idx].payload)
+        if idx in self._patches:
+            payload.update(self._patches[idx])
+        return reconstruct_message(payload)
+
+    async def create(self, **_kwargs: Any) -> Any:
+        return self._next_message()
+
+    def stream(self, **_kwargs: Any) -> _AsyncFakeStreamManager:
+        return _AsyncFakeStreamManager(self._next_message())

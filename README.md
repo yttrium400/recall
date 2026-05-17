@@ -216,9 +216,9 @@ recall stats .recall/sessions/<session-file>.json
 - [x] `recall diff` - compare sessions, highlight divergence
 - [x] `recall replay` - deterministic replay, zero API calls
 - [x] Response patching - inject different responses to test fixes
-- [ ] `recall export --format markdown` - shareable session reports
-- [ ] Async client support
-- [ ] Tool call visualization in play view
+- [x] `recall export --format markdown` - shareable session reports
+- [x] Async client support (`AsyncAnthropic`, `AsyncOpenAI`)
+- [x] Tool call visualization in play view
 
 ---
 

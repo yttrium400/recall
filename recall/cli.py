@@ -81,16 +81,9 @@ def _render_pretty(session: Session, step: bool) -> None:
         for msg in new_messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                text = _format_content_blocks(content)
-            else:
-                text = str(content)
-
             color = "green" if role == "user" else "blue"
             label = f"[bold {color}]{role}[/bold {color}]"
-            console.print(f"  {label}: {text}")
+            _render_message_content(label, content)
 
         if resp:
             if resp.type == "error":
@@ -102,12 +95,8 @@ def _render_pretty(session: Session, step: bool) -> None:
                     )
                 )
             else:
-                resp_content = resp.payload.get("content", [])
-                if isinstance(resp_content, list):
-                    assistant_text = _format_content_blocks(resp_content)
-                else:
-                    assistant_text = str(resp_content)
-                console.print(f"  [bold blue]assistant[/bold blue]: {assistant_text}")
+                resp_content = _extract_resp_content(resp.payload)
+                _render_message_content("[bold blue]assistant[/bold blue]", resp_content)
 
                 usage = resp.payload.get("usage", {})
                 in_tok = usage.get("input_tokens", 0)
@@ -124,6 +113,7 @@ def _render_pretty(session: Session, step: bool) -> None:
 
 
 def _format_content_blocks(blocks: list[dict[str, Any]]) -> str:
+    """Return plain-text representation of content blocks (used for markdown export)."""
     parts = []
     for block in blocks:
         btype = block.get("type", "")
@@ -141,6 +131,54 @@ def _format_content_blocks(blocks: list[dict[str, Any]]) -> str:
         else:
             parts.append(json.dumps(block))
     return "\n    ".join(parts)
+
+
+def _render_message_content(label: str, content: Any) -> None:
+    """Render a message with Rich panel visualization for tool calls."""
+    if isinstance(content, str):
+        console.print(f"  {label}: {content}")
+        return
+    if not isinstance(content, list):
+        console.print(f"  {label}: {content}")
+        return
+
+    text_parts = [b.get("text", "") for b in content if b.get("type") == "text"]
+    has_tools = any(b.get("type") in ("tool_use", "tool_result") for b in content)
+
+    if text_parts:
+        console.print(f"  {label}: {' '.join(text_parts)}")
+    elif has_tools:
+        console.print(f"  {label}:")
+    else:
+        console.print(f"  {label}:")
+
+    for block in content:
+        btype = block.get("type", "")
+        if btype == "tool_use":
+            name = block.get("name", "")
+            tool_id = block.get("id", "")
+            inp = json.dumps(block.get("input", {}), indent=2)
+            id_suffix = f"  [dim]{tool_id}[/dim]" if tool_id else ""
+            console.print(Panel(
+                Syntax(inp, "json", theme="monokai", word_wrap=True),
+                title=f"[bold yellow]tool_use[/bold yellow]: [cyan]{name}[/cyan]{id_suffix}",
+                border_style="yellow",
+                padding=(0, 1),
+                expand=False,
+            ))
+        elif btype == "tool_result":
+            tool_content = block.get("content", "")
+            if isinstance(tool_content, list):
+                tool_content = _extract_text(tool_content)
+            tool_id = block.get("tool_use_id", "")
+            id_suffix = f"  [dim]{tool_id}[/dim]" if tool_id else ""
+            console.print(Panel(
+                str(tool_content),
+                title=f"[bold green]tool_result[/bold green]{id_suffix}",
+                border_style="green",
+                padding=(0, 1),
+                expand=False,
+            ))
 
 
 def _render_raw(session: Session, step: bool) -> None:
@@ -298,6 +336,168 @@ def ls(
             table.add_row(p.name, "-", "-", "-", "-", "-")
 
     console.print(table)
+
+
+@app.command()
+def export(
+    path: Path = typer.Argument(..., help="Path to a session JSON file"),
+    format: str = typer.Option("markdown", "--format", "-f", help="Output format (markdown)"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write to file instead of stdout"),
+) -> None:
+    """Export a session to a shareable format (default: markdown)."""
+    if not path.exists():
+        console.print(f"[red]File not found:[/red] {path}")
+        raise typer.Exit(1)
+
+    if format != "markdown":
+        console.print(f"[red]Unsupported format:[/red] {format}. Only 'markdown' is supported.")
+        raise typer.Exit(1)
+
+    session = load(path)
+    md = _render_markdown(session)
+
+    if output:
+        output.write_text(md, encoding="utf-8")
+        console.print(f"[green]Exported to[/green] {output}")
+    else:
+        print(md)
+
+
+def _extract_resp_content(payload: dict[str, Any]) -> Any:
+    """Return the assistant content from a response payload (handles Anthropic and OpenAI)."""
+    content = payload.get("content")
+    if content is not None:
+        return content
+    choices = payload.get("choices", [])
+    if choices:
+        msg_content = choices[0].get("message", {}).get("content", "")
+        return msg_content if msg_content else []
+    return []
+
+
+def _render_markdown(session: Session) -> str:
+    lines: list[str] = []
+
+    lines.append("# Recall Session Report\n")
+    lines.append(f"**Session ID:** {session.id}  ")
+    lines.append(f"**Provider:** {session.provider}  ")
+    lines.append(f"**Model:** {session.model or '(unknown)'}  ")
+    lines.append(f"**Started:** {session.started_at}  ")
+    lines.append("")
+
+    requests = [e for e in session.events if e.type == "request"]
+    events_by_seq = {e.seq: e for e in session.events}
+    pairs: list[tuple[Any, Any]] = []
+    for req in requests:
+        following = events_by_seq.get(req.seq + 1)
+        pairs.append((req, following if following and following.type != "request" else None))
+
+    displayed_count = 0
+    total_in = total_out = total_ms = 0
+    costs: list[float] = []
+
+    for call_idx, (req, resp) in enumerate(pairs):
+        lines.append("---\n")
+        ts = req.timestamp.split("T")[-1].rstrip("Z")
+        lines.append(f"## Call #{call_idx + 1} — {ts}\n")
+
+        payload = req.payload
+        all_messages: list[dict[str, Any]] = payload.get("messages", [])
+        system = payload.get("system", "")
+
+        if call_idx == 0 and system:
+            system_text = system if isinstance(system, str) else json.dumps(system)
+            lines.append("**System:**\n")
+            for sline in system_text.splitlines():
+                lines.append(f"> {sline}")
+            lines.append("")
+
+        new_messages = all_messages[displayed_count:]
+        displayed_count = len(all_messages) + 1
+
+        for msg in new_messages:
+            role = msg.get("role", "").capitalize()
+            content = msg.get("content", "")
+            lines.extend(_md_message(role, content))
+
+        if resp:
+            if resp.type == "error":
+                lines.append(f"**Error:** `{resp.payload.get('type', 'Error')}`: {resp.payload.get('error', '')}\n")
+            else:
+                resp_content = _extract_resp_content(resp.payload)
+                lines.extend(_md_message("Assistant", resp_content))
+
+                usage = resp.payload.get("usage", {})
+                in_tok = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                out_tok = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                total_in += in_tok
+                total_out += out_tok
+                if resp.duration_ms:
+                    total_ms += resp.duration_ms
+                cost = _estimate_cost(session.provider, session.model, in_tok, out_tok)
+                cost_str = f" | ~${cost:.6f}" if cost is not None else ""
+                if cost is not None:
+                    costs.append(cost)
+                dur_str = f" | {resp.duration_ms}ms" if resp.duration_ms else ""
+                lines.append(f"> *{in_tok} in / {out_tok} out{cost_str}{dur_str}*\n")
+
+    lines.append("---\n")
+    lines.append("## Summary\n")
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    lines.append(f"| Total calls | {len(pairs)} |")
+    lines.append(f"| Input tokens | {total_in:,} |")
+    lines.append(f"| Output tokens | {total_out:,} |")
+    if costs:
+        lines.append(f"| Estimated cost | ${sum(costs):.6f} |")
+    if total_ms:
+        lines.append(f"| Total latency | {total_ms:,}ms |")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _md_message(role: str, content: Any) -> list[str]:
+    lines: list[str] = []
+    if isinstance(content, str):
+        lines.append(f"**{role}:** {content}\n")
+        return lines
+
+    if not isinstance(content, list):
+        lines.append(f"**{role}:** {content}\n")
+        return lines
+
+    text_parts = [b.get("text", "") for b in content if b.get("type") == "text"]
+    has_tools = any(b.get("type") in ("tool_use", "tool_result") for b in content)
+
+    if text_parts:
+        lines.append(f"**{role}:** {' '.join(text_parts)}\n")
+    elif has_tools:
+        lines.append(f"**{role}:**\n")
+
+    for block in content:
+        btype = block.get("type", "")
+        if btype == "tool_use":
+            name = block.get("name", "")
+            tool_id = block.get("id", "")
+            inp = json.dumps(block.get("input", {}), indent=2)
+            id_note = f" `{tool_id}`" if tool_id else ""
+            lines.append(f"**Tool call:** `{name}`{id_note}\n")
+            lines.append("```json")
+            lines.append(inp)
+            lines.append("```\n")
+        elif btype == "tool_result":
+            tool_content = block.get("content", "")
+            if isinstance(tool_content, list):
+                tool_content = _extract_text(tool_content)
+            tool_id = block.get("tool_use_id", "")
+            id_note = f" `{tool_id}`" if tool_id else ""
+            lines.append(f"**Tool result:**{id_note}\n")
+            lines.append("```")
+            lines.append(str(tool_content))
+            lines.append("```\n")
+
+    return lines
 
 
 @app.command()
